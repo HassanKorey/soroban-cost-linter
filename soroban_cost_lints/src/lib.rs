@@ -76,14 +76,11 @@ extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 
-use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_sugg};
+use clippy_utils::diagnostics::span_lint_and_help;
 use clippy_utils::get_enclosing_loop_or_multi_call_closure;
 use clippy_utils::res::MaybeResPath;
-use clippy_utils::source::snippet_opt;
 use clippy_utils::ty::peel_and_count_ty_refs;
 use clippy_utils::usage::local_used_after_expr;
-use clippy_utils::usage::mutated_variables;
-use rustc_ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_hir::HirIdSet;
@@ -96,6 +93,7 @@ use rustc_span::def_id::DefId;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
+
 
 dylint_linting::dylint_library!();
 
@@ -128,8 +126,26 @@ fn match_soroban_def_path(cx: &LateContext<'_>, def_id: DefId, segments: &[&str]
     full.ends_with(&suffix)
 }
 
-/// Soroban storage accessor types. Every method call on one of these reaches
-/// the host's storage subsystem.
+/// Returns whether `expr_ty` is one of the requested Soroban ADT types.
+///
+/// References are peeled before inspecting the type so callers can use this
+/// helper for both owned values and references to SDK wrapper types.
+fn is_type_match<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr_ty: Ty<'tcx>,
+    target_paths: &[&[&str]],
+) -> bool {
+    let peeled_ty = expr_ty.peel_refs();
+
+    if let rustc_middle::ty::Adt(adt_def, _) = peeled_ty.kind() {
+        target_paths
+            .iter()
+            .any(|path| match_soroban_def_path(cx, adt_def.did(), path))
+    } else {
+        false
+    }
+}
+
 const SOROBAN_STORAGE_TYPES: &[&[&str]] = &[
     &["soroban_sdk", "storage", "Storage"],
     &["soroban_sdk", "storage", "Instance"],
@@ -137,12 +153,6 @@ const SOROBAN_STORAGE_TYPES: &[&[&str]] = &[
     &["soroban_sdk", "storage", "Temporary"],
 ];
 
-/// Soroban host accessor types reachable from `Env`. A method call on any of
-/// them crosses the guest/host boundary and is metered, so repeating it inside
-/// a loop with unchanged inputs is wasted CPU budget.
-///
-/// `soroban_sdk::storage::*` is deliberately absent: storage operations in a
-/// loop are reported by [`SOROBAN_STORAGE_IN_LOOP`] instead.
 const SOROBAN_HOST_TYPES: &[&[&str]] = &[
     &["soroban_sdk", "ledger", "Ledger"],
     &["soroban_sdk", "crypto", "Crypto"],
@@ -408,20 +418,6 @@ fn enclosing_loop<'tcx>(
     matches!(enclosing.kind, hir::ExprKind::Loop(..)).then_some(enclosing)
 }
 
-/// Whether `expr` sits inside something the runtime will execute more than
-/// once: a syntactic loop, **or** a multi-call closure (`for_each`,
-/// `Iterator::map` argument, etc.).
-///
-/// `get_enclosing_loop_or_multi_call_closure` already restricts itself to
-/// closures that are invoked more than once, so a single-call closure is
-/// not surfaced here — only a closure whose body runs repeatedly is.
-///
-/// We deliberately keep `enclosing_loop` and this helper side-by-side
-/// rather than collapsing to a single function: storage and `HostInLoop`
-/// intentionally need a syntactic loop (closing over stored state from a
-/// closure body is not yet analyzed by `depends_on_loop_state` — that's a
-/// separate tracked issue), while `UnnecessaryHostFunctionCall` benefits
-/// from reporting repeated calls inside iterator closures.
 fn enclosing_loop_or_closure<'tcx>(
     cx: &LateContext<'tcx>,
     expr: &'tcx hir::Expr<'tcx>,
@@ -673,25 +669,14 @@ impl<'tcx> LateLintPass<'tcx> for SorobanStorageInLoop {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
         // --- Direct storage access in a loop ---
         if let hir::ExprKind::MethodCall(path_segment, receiver, _args, _span) = expr.kind {
-            // Only fire on terminal storage operations (`get` / `has` /
-            // `set`). The intermediate calls — `env.storage()`,
-            // `.instance()` / `.persistent()` / `.temporary()` — are just
-            // accessor wrappers, so firing on them as well produces up to
-            // three stacked warnings on a single chained expression like
-            // `env.storage().instance().set(&k, &v)`. With this filter the
-            // same chain gives exactly one warning, keyed on the operation
-            // that actually crosses the host boundary.
             let method_name = path_segment.ident.name.as_str();
             let is_terminal_storage_op = matches!(method_name, "get" | "has" | "set");
-
             let is_storage_access = is_terminal_storage_op
-                && if let rustc_middle::ty::Adt(adt_def, _) =
-                    cx.typeck_results().expr_ty(receiver).peel_refs().kind()
-                {
-                    matches_any_path(cx, adt_def.did(), SOROBAN_STORAGE_TYPES)
-                } else {
-                    false
-                };
+                && is_type_match(
+                    cx,
+                    cx.typeck_results().expr_ty(receiver),
+                    SOROBAN_STORAGE_TYPES,
+                );
 
             if is_storage_access && enclosing_loop_or_closure(cx, expr).is_some() {
                 // Reads (`get`, `has`) and writes (`set`) deserve different
@@ -1092,23 +1077,14 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryHostFunctionCall {
                 false
             };
 
-            // Accept both syntactic loops (`for` / `while` / `loop`) and
-            // multi-call closures (the body of `Iterator::for_each`, ...).
-            // A closure that the runtime calls once per element is just as
-            // bad as a hand-written loop: the host function fires every
-            // iteration either way, and the cost shows up in the same place
-            // on the metered resources.
-            if is_host_function
-                && let Some(loop_expr) = enclosing_loop_or_closure(cx, expr)
-                && !depends_on_loop_state(cx, loop_expr, expr)
-            {
+            if is_host_function && enclosing_loop_or_closure(cx, expr).is_some() {
                 span_lint_and_help(
                     cx,
                     UNNECESSARY_HOST_FUNCTION_CALL,
                     expr.span,
                     "unnecessary host function call inside loop",
                     None,
-                    "call this function outside the loop and reuse the result",
+                    "cache the result outside the loop when the call is loop-invariant",
                 );
             }
         }
