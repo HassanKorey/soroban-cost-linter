@@ -92,8 +92,6 @@ use clippy_utils::{get_parent_expr, is_in_test};
 use rustc_ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
-use rustc_hir::HirIdSet;
-use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::intravisit::{self, FnKind, Visitor};
 use rustc_hir::{FnDecl, HirId, HirIdSet};
 use rustc_lint::{EarlyContext, EarlyLintPass, LateContext, LateLintPass, LintStore};
@@ -487,7 +485,6 @@ pub const LINT_METADATA: &[LintMetadata] = &[
         category: LintCategory::StorageOperations,
     },
     LintMetadata {
-        lint: UNBOUNDED_INPUT_LOOP,
         lint: SOROBAN_REDUNDANT_STORAGE_READ,
         category: LintCategory::StorageOperations,
     },
@@ -613,12 +610,6 @@ pub fn register_lints(_sess: &rustc_session::Session, lint_store: &mut LintStore
         REQUIRE_AUTH_IN_LOOP,
         SYMBOL_NEW_FOR_SHORT_LITERAL,
         PERSISTENT_READ_WITHOUT_TTL_EXTENSION,
-        UNNECESSARY_STRING_TO_BYTES,
-        STORAGE_WRITE_WITHOUT_READ,
-        INEFFICIENT_BYTES_CONCAT,
-        MAP_INSERT_IN_LOOP,
-        BYTES_APPEND_IN_LOOP,
-        SIGNATURE_VERIFICATION_IN_LOOP,
         INSTANCE_STORAGE_FOR_UNBOUNDED_DATA,
         FORMATTED_PANIC_PAYLOAD,
     ]);
@@ -644,12 +635,6 @@ pub fn register_lints(_sess: &rustc_session::Session, lint_store: &mut LintStore
     lint_store.register_late_pass(|_| Box::new(RequireAuthInLoop));
     lint_store.register_late_pass(|_| Box::new(SymbolNewForShortLiteral));
     lint_store.register_late_pass(|_| Box::new(PersistentReadWithoutTtlExtension));
-    lint_store.register_late_pass(|_| Box::new(UnnecessaryStringToBytes));
-    lint_store.register_late_pass(|_| Box::new(StorageWriteWithoutRead));
-    lint_store.register_late_pass(|_| Box::new(InefficientBytesConcat));
-    lint_store.register_late_pass(|_| Box::new(MapInsertInLoop));
-    lint_store.register_late_pass(|_| Box::new(BytesAppendInLoop));
-    lint_store.register_late_pass(|_| Box::new(SignatureVerificationInLoop));
     lint_store.register_late_pass(|_| Box::new(InstanceStorageForUnboundedData));
 
     // `formatted_panic_payload` needs the AST-level `format_args!` nodes to
@@ -928,11 +913,7 @@ impl SorobanRedundantStorageRead {
                 key_arg
             };
 
-            let key_text = cx
-                .sess()
-                .source_map()
-                .span_to_snippet(key_inner.span)
-                .ok()?;
+            let key_text = snippet_opt(cx, key_inner.span)?;
 
             Some(StorageOp::Read {
                 storage_def_id,
@@ -961,7 +942,7 @@ impl<'tcx> LateLintPass<'tcx> for SorobanRedundantStorageRead {
             .stmts
             .iter()
             .filter_map(|stmt| match stmt.kind {
-                hir::StmtKind::Let(hir::LetStmt {
+                hir::StmtKind::Let(&hir::LetStmt {
                     init: Some(init), ..
                 }) => Some(init),
                 hir::StmtKind::Expr(expr) | hir::StmtKind::Semi(expr) => Some(expr),
@@ -1024,7 +1005,9 @@ impl<'tcx> LateLintPass<'tcx> for RedundantEnvClone {
             expr.kind
             && path_segment.ident.name.as_str() == "clone"
         {
-            let is_env = if let Some(adt_def) = try_get_adt_def(cx, receiver) {
+            let is_env = if let Some(adt_def) =
+                ty_adt_def(cx.typeck_results().expr_ty(receiver).peel_refs())
+            {
                 match_soroban_def_path(cx, adt_def.did(), &["soroban_sdk", "Env"])
             } else {
                 false
@@ -1112,7 +1095,9 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryHostFunctionCall {
     /// change each iteration from being flagged.
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
         if let hir::ExprKind::MethodCall(path_segment, receiver, _args, _span) = expr.kind {
-            let is_host_function = if let Some(adt_def) = try_get_adt_def(cx, receiver) {
+            let is_host_function = if let Some(adt_def) =
+                ty_adt_def(cx.typeck_results().expr_ty(receiver).peel_refs())
+            {
                 let did = adt_def.did();
                 matches_any_path(cx, did, SOROBAN_HOST_TYPES)
                     || (match_soroban_def_path(cx, did, &["soroban_sdk", "Env"])
@@ -1158,7 +1143,9 @@ impl<'tcx> LateLintPass<'tcx> for HostInLoop {
     /// help note suggesting the call be moved out where possible.
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx hir::Expr<'tcx>) {
         if let hir::ExprKind::MethodCall(_path_segment, receiver, _args, _span) = expr.kind {
-            let is_host = if let Some(adt_def) = try_get_adt_def(cx, receiver) {
+            let is_host = if let Some(adt_def) =
+                ty_adt_def(cx.typeck_results().expr_ty(receiver).peel_refs())
+            {
                 match_soroban_def_path(cx, adt_def.did(), &["host", "Host"])
             } else {
                 false
@@ -1608,7 +1595,9 @@ impl<'tcx> LateLintPass<'tcx> for BytesAppendInLoop {
                 return;
             }
 
-            let is_container = if let Some(adt_def) = try_get_adt_def(cx, receiver) {
+            let is_container = if let Some(adt_def) =
+                ty_adt_def(cx.typeck_results().expr_ty(receiver).peel_refs())
+            {
                 matches_any_path(cx, adt_def.did(), SOROBAN_CONTAINER_TYPES)
             } else {
                 false
@@ -1675,7 +1664,6 @@ impl<'tcx> LateLintPass<'tcx> for StorageWriteWithoutRead {
         /// receiver-snippet and key-snippet for later cross-referencing.
         struct ReadVisitor<'a, 'tcx> {
             cx: &'a LateContext<'tcx>,
-            reads: std::collections::HashMap<String, std::collections::HashSet<String>>,
             reads: HashSet<(String, String)>,
         }
 
@@ -1684,7 +1672,9 @@ impl<'tcx> LateLintPass<'tcx> for StorageWriteWithoutRead {
             /// `has` call on a [`SOROBAN_STORAGE_TYPES`] receiver.
             fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
                 if let hir::ExprKind::MethodCall(path_segment, receiver, args, _span) = &expr.kind {
-                    let is_storage = if let Some(adt_def) = try_get_adt_def(self.cx, receiver) {
+                    let is_storage = if let Some(adt_def) =
+                        ty_adt_def(self.cx.typeck_results().expr_ty(receiver).peel_refs())
+                    {
                         matches_any_path(self.cx, adt_def.did(), SOROBAN_STORAGE_TYPES)
                     } else {
                         false
@@ -1698,10 +1688,6 @@ impl<'tcx> LateLintPass<'tcx> for StorageWriteWithoutRead {
                         let receiver_snippet =
                             snippet_opt(self.cx, receiver.span).unwrap_or_default();
                         let key_snippet = snippet_opt(self.cx, args[0].span).unwrap_or_default();
-                        self.reads
-                            .entry(receiver_snippet)
-                            .or_default()
-                            .insert(key_snippet);
                         self.reads.insert((receiver_snippet, key_snippet));
                     }
                 }
@@ -1721,7 +1707,9 @@ impl<'tcx> LateLintPass<'tcx> for StorageWriteWithoutRead {
             /// `set` call on a [`SOROBAN_STORAGE_TYPES`] receiver.
             fn visit_expr(&mut self, expr: &'tcx hir::Expr<'tcx>) {
                 if let hir::ExprKind::MethodCall(path_segment, receiver, args, span) = &expr.kind {
-                    let is_storage = if let Some(adt_def) = try_get_adt_def(self.cx, receiver) {
+                    let is_storage = if let Some(adt_def) =
+                        ty_adt_def(self.cx.typeck_results().expr_ty(receiver).peel_refs())
+                    {
                         matches_any_path(self.cx, adt_def.did(), SOROBAN_STORAGE_TYPES)
                     } else {
                         false
@@ -1738,7 +1726,6 @@ impl<'tcx> LateLintPass<'tcx> for StorageWriteWithoutRead {
             }
         }
 
-        let reads = std::collections::HashMap::new();
         let reads = HashSet::new();
         let writes = Vec::new();
         let mut read_visitor = ReadVisitor { cx, reads };
@@ -1750,8 +1737,6 @@ impl<'tcx> LateLintPass<'tcx> for StorageWriteWithoutRead {
         for (w_receiver, w_key, w_span) in &write_visitor.writes {
             let has_read = read_visitor
                 .reads
-                .get(w_receiver)
-                .is_some_and(|keys| keys.contains(w_key));
                 .contains(&(w_receiver.clone(), w_key.clone()));
             if !has_read {
                 span_lint_and_help(
@@ -1821,7 +1806,7 @@ fn is_bytes_type<'tcx>(cx: &LateContext<'tcx>, ty: rustc_middle::ty::Ty<'tcx>) -
 /// Extracts the `AdtDef` from a `Ty`, without peeling references.
 fn ty_adt_def<'tcx>(ty: rustc_middle::ty::Ty<'tcx>) -> Option<rustc_middle::ty::AdtDef<'tcx>> {
     if let rustc_middle::ty::Adt(adt_def, _) = ty.kind() {
-        Some(adt_def)
+        Some(*adt_def)
     } else {
         None
     }
@@ -1854,7 +1839,9 @@ impl<'tcx> LateLintPass<'tcx> for MapInsertInLoop {
                 return;
             }
 
-            let is_map = if let Some(adt_def) = try_get_adt_def(cx, receiver) {
+            let is_map = if let Some(adt_def) =
+                ty_adt_def(cx.typeck_results().expr_ty(receiver).peel_refs())
+            {
                 match_soroban_def_path(cx, adt_def.did(), &["soroban_sdk", "Map"])
             } else {
                 false
@@ -2235,7 +2222,7 @@ impl<'tcx> LateLintPass<'tcx> for PersistentReadWithoutTtlExtension {
         _decl: &'tcx hir::FnDecl<'tcx>,
         body: &'tcx hir::Body<'tcx>,
         _span: rustc_span::Span,
-        _hir_id: rustc_hir::HirId,
+        _hir_id: rustc_hir::def_id::LocalDefId,
     ) {
         let mut visitor = PersistentReadVisitor {
             cx,
